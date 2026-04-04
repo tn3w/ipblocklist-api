@@ -102,7 +102,12 @@ fn parse(data: &[u8]) -> Blocklist {
         let flags_mask = read_u32_le(&mut c);
         let cats_mask = read_u8(&mut c);
 
-        feeds.push(Feed { name, score, flags_mask, cats_mask });
+        feeds.push(Feed {
+            name,
+            score,
+            flags_mask,
+            cats_mask,
+        });
 
         let range_count = read_u32_le(&mut c) as usize;
         let mut v4: Vec<(u32, u32)> = Vec::new();
@@ -120,10 +125,16 @@ fn parse(data: &[u8]) -> Blocklist {
         }
 
         if !v4.is_empty() {
-            ipv4_feeds.push(Ranges4 { feed_idx: feed_idx as u16, ranges: v4.into() });
+            ipv4_feeds.push(Ranges4 {
+                feed_idx: feed_idx as u16,
+                ranges: v4.into(),
+            });
         }
         if !v6.is_empty() {
-            ipv6_feeds.push(Ranges6 { feed_idx: feed_idx as u16, ranges: v6.into() });
+            ipv6_feeds.push(Ranges6 {
+                feed_idx: feed_idx as u16,
+                ranges: v6.into(),
+            });
         }
     }
 
@@ -326,10 +337,12 @@ fn main() {
     }
 
     let bg = state.clone();
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(86400));
-        if let Some(data) = download() {
-            *bg.write().unwrap() = Some(Arc::new(parse(&data)));
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(86400));
+            if let Some(data) = download() {
+                *bg.write().unwrap() = Some(Arc::new(parse(&data)));
+            }
         }
     });
 
