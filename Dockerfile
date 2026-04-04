@@ -1,11 +1,11 @@
-FROM rust:1-slim AS build
+FROM rust:alpine AS build
 WORKDIR /app
+RUN apk add --no-cache musl-dev
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl && rm -rf /var/lib/apt/lists/*
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates curl
 COPY --from=build /app/target/release/ipblocklist-api /app
 CMD ["/app"]
