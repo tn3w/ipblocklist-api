@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 4] = b"IPBL";
 const BLOCKLIST_URL: &str = "https://github.com/tn3w/IPBlocklist\
@@ -339,7 +339,18 @@ fn main() {
     let bg = state.clone();
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(86400));
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let secs_since_midnight = now % 86400;
+            let target = 3600; // 01:00 UTC
+            let secs_until_target = if secs_since_midnight < target {
+                target - secs_since_midnight
+            } else {
+                86400 - secs_since_midnight + target
+            };
+            thread::sleep(Duration::from_secs(secs_until_target));
             if let Some(data) = download() {
                 *bg.write().unwrap() = Some(Arc::new(parse(&data)));
             }
