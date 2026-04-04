@@ -247,7 +247,7 @@ fn lookup<'a>(bl: &'a Blocklist, ip: IpAddr) -> LookupResult<'a> {
 fn download() -> Option<Vec<u8>> {
     eprintln!("downloading blocklist...");
     let output = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-filesize", "104857600", BLOCKLIST_URL])
+        .args(["-fsSL", BLOCKLIST_URL])
         .output()
         .ok()?;
     if !output.status.success() {
