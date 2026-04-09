@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,33 @@ struct Blocklist {
 }
 
 type State = Arc<RwLock<Option<Arc<Blocklist>>>>;
+
+struct ThreadPool {
+    tx: std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
+}
+
+impl ThreadPool {
+    fn new(workers: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(workers);
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..workers {
+            let rx = rx.clone();
+            thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn(move || {
+                    while let Ok(job) = rx.lock().unwrap().recv() {
+                        job();
+                    }
+                })
+                .unwrap();
+        }
+        ThreadPool { tx }
+    }
+
+    fn execute<F: FnOnce() + Send + 'static>(&self, f: F) {
+        let _ = self.tx.send(Box::new(f));
+    }
+}
 
 fn read_varint(c: &mut Cursor<&[u8]>) -> u128 {
     let mut result: u128 = 0;
@@ -168,7 +195,7 @@ fn resolve_cats<'a>(table: &'a [Box<str>], mask: u8) -> Vec<&'a str> {
 }
 
 struct LookupResult<'a> {
-    ip: String,
+    ip: IpAddr,
     max_score: f32,
     top_category: &'a str,
     categories: Vec<&'a str>,
@@ -176,26 +203,44 @@ struct LookupResult<'a> {
     feeds: Vec<&'a str>,
 }
 
-fn json_escape(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+fn write_json_str(buf: &mut Vec<u8>, s: &str) {
+    buf.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'\\' => buf.extend_from_slice(b"\\\\"),
+            b'"' => buf.extend_from_slice(b"\\\""),
+            _ => buf.push(b),
+        }
+    }
+    buf.push(b'"');
 }
 
-fn json_str_array(items: &[&str]) -> String {
-    let inner: Vec<String> = items.iter().map(|s| json_escape(s)).collect();
-    format!("[{}]", inner.join(","))
+fn write_json_array(buf: &mut Vec<u8>, items: &[&str]) {
+    buf.push(b'[');
+    for (i, s) in items.iter().enumerate() {
+        if i > 0 {
+            buf.push(b',');
+        }
+        write_json_str(buf, s);
+    }
+    buf.push(b']');
 }
 
 impl LookupResult<'_> {
-    fn to_json(&self) -> String {
-        format!(
-            r#"{{"ip":{},"max_score":{:.4},"top_category":{},"categories":{},"flags":{},"feeds":{}}}"#,
-            json_escape(&self.ip),
-            self.max_score,
-            json_escape(self.top_category),
-            json_str_array(&self.categories),
-            json_str_array(&self.flags),
-            json_str_array(&self.feeds),
-        )
+    fn write_json(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(b"{\"ip\":\"");
+        write!(buf, "{}", self.ip).unwrap();
+        buf.extend_from_slice(b"\",\"max_score\":");
+        write!(buf, "{:.4}", self.max_score).unwrap();
+        buf.extend_from_slice(b",\"top_category\":");
+        write_json_str(buf, self.top_category);
+        buf.extend_from_slice(b",\"categories\":");
+        write_json_array(buf, &self.categories);
+        buf.extend_from_slice(b",\"flags\":");
+        write_json_array(buf, &self.flags);
+        buf.extend_from_slice(b",\"feeds\":");
+        write_json_array(buf, &self.feeds);
+        buf.push(b'}');
     }
 }
 
@@ -246,7 +291,7 @@ fn lookup<'a>(bl: &'a Blocklist, ip: IpAddr) -> LookupResult<'a> {
         .unwrap_or("none");
 
     LookupResult {
-        ip: ip.to_string(),
+        ip,
         max_score,
         top_category,
         categories: all_cats,
@@ -269,13 +314,16 @@ fn download() -> Option<Vec<u8>> {
     Some(output.stdout)
 }
 
-fn send_json(stream: &mut TcpStream, body: &str) {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes());
+fn send_json(stream: &mut TcpStream, body: &[u8]) {
+    let mut header = Vec::with_capacity(128);
+    write!(
+        header,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    let _ = stream.write_all(&header);
+    let _ = stream.write_all(body);
 }
 
 fn handle(mut stream: TcpStream, state: &State) {
@@ -293,11 +341,18 @@ fn handle(mut stream: TcpStream, state: &State) {
 
     if url == "/health" {
         let guard = state.read().unwrap();
-        let body = match guard.as_ref() {
-            Some(bl) => format!(r#"{{"status":"ok","timestamp":{}}}"#, bl.timestamp),
-            None => r#"{"status":"loading"}"#.to_string(),
-        };
-        send_json(&mut stream, &body);
+        match guard.as_ref() {
+            Some(bl) => {
+                let mut buf = Vec::with_capacity(64);
+                write!(buf, r#"{{"status":"ok","timestamp":{}}}"#, bl.timestamp).unwrap();
+                drop(guard);
+                send_json(&mut stream, &buf);
+            }
+            None => {
+                drop(guard);
+                send_json(&mut stream, br#"{"status":"loading"}"#);
+            }
+        }
         return;
     }
 
@@ -305,7 +360,7 @@ fn handle(mut stream: TcpStream, state: &State) {
         let ip: IpAddr = match ip_str.parse() {
             Ok(ip) => ip,
             Err(_) => {
-                send_json(&mut stream, r#"{"error":"invalid IP"}"#);
+                send_json(&mut stream, br#"{"error":"invalid IP"}"#);
                 return;
             }
         };
@@ -314,17 +369,19 @@ fn handle(mut stream: TcpStream, state: &State) {
         let bl = match guard.as_ref() {
             Some(bl) => bl.clone(),
             None => {
-                send_json(&mut stream, r#"{"error":"not loaded"}"#);
+                send_json(&mut stream, br#"{"error":"not loaded"}"#);
                 return;
             }
         };
         drop(guard);
 
-        send_json(&mut stream, &lookup(&bl, ip).to_json());
+        let mut buf = Vec::with_capacity(512);
+        lookup(&bl, ip).write_json(&mut buf);
+        send_json(&mut stream, &buf);
         return;
     }
 
-    send_json(&mut stream, r#"{"error":"not found"}"#);
+    send_json(&mut stream, br#"{"error":"not found"}"#);
 }
 
 fn main() {
@@ -365,8 +422,13 @@ fn main() {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).unwrap();
     eprintln!("listening on :{port}");
 
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8);
+    let pool = ThreadPool::new(workers);
+
     for stream in listener.incoming().flatten() {
         let state = state.clone();
-        thread::spawn(move || handle(stream, &state));
+        pool.execute(move || handle(stream, &state));
     }
 }
